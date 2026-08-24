@@ -1,0 +1,127 @@
+name: laravel-ci
+
+# The fleet's CI pipeline, in one place. Every repo's .github/workflows/ci.yml
+# is a thin caller of this file, so changing what CI does is one commit here
+# rather than the same edit pasted into seven repositories.
+#
+# Detection, not prevention. The apps calling this still ship via Ploi, which
+# deploys on push no matter what CI says, and Ploi ignores [skip ci]. A red run
+# is therefore an alarm that fires minutes after a bad push, not a gate that
+# stops one — worth having because the alternative is never finding out
+# (WO-001 found 18 unnoticed security advisories across the fleet, one of them
+# high severity and live in three production apps).
+#
+# Real gating arrives with the Coolify migration: per the CI standard in
+# jims_dev_way/playbooks/deployment.md, a migrated app's ci.yml gains a deploy
+# job that runs only on the prod/staging branches and only after this one passes.
+#
+# Callers also carry a weekly schedule: trigger, because push-only CI never
+# warns an untouched repo about a new advisory.
+
+on:
+  workflow_call:
+    inputs:
+      build-assets:
+        description: >-
+          Build front-end assets before the test run. Needed by apps whose
+          feature tests render Blade views calling @vite: public/build is
+          gitignored, so without a build those tests 500 with
+          ViteManifestNotFoundException. Apps whose suites never render a
+          Vite-using view leave this off.
+        type: boolean
+        default: false
+      package-mode:
+        description: >-
+          Run as a library rather than an application. Tests go through
+          orchestra/testbench, so there is no .env, no application key, no
+          Passport keys and no asset build to prepare; Pint and Pest run via
+          composer scripts; and the dependency cache keys on composer.json
+          because a library correctly does not commit composer.lock.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Lint, test, audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up PHP 8.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          # intl/zip are required by vendor packages; sqlite backs the test
+          # suite (phpunit.xml pins sqlite :memory:); gd covers the apps that do
+          # image handling. One list fleet-wide, so no repo drifts on its own.
+          extensions: intl, zip, gd, pdo_sqlite, sqlite3
+          coverage: none
+          tools: composer:v2
+
+      - name: Resolve the Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          # Applications pin exact versions in composer.lock; a library has no
+          # lock file to key on, so its cache follows composer.json instead.
+          key: composer-${{ runner.os }}-php8.4-${{ hashFiles(inputs.package-mode && 'composer.json' || '**/composer.lock') }}
+          restore-keys: composer-${{ runner.os }}-php8.4-
+
+      - name: Install Composer dependencies
+        # bcl/toolkit resolves through a public VCS repository; the token is not
+        # for access, only to lift GitHub's anonymous API rate limit, which
+        # shared runners hit regularly.
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Check formatting (Pint)
+        if: ${{ ! inputs.package-mode }}
+        run: vendor/bin/pint --test
+
+      - name: Check formatting (Pint)
+        if: ${{ inputs.package-mode }}
+        run: composer pint -- --test
+
+      - name: Prepare the test environment
+        if: ${{ ! inputs.package-mode }}
+        # Passport's OAuth keys are gitignored, so a fresh checkout has none and
+        # any test that boots the passport guard dies with "Invalid key
+        # supplied". These are throwaway CI keys.
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          php artisan passport:keys --no-interaction
+
+      - name: Set up Node 22
+        if: ${{ inputs.build-assets }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Build front-end assets
+        if: ${{ inputs.build-assets }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Run tests (Pest)
+        if: ${{ ! inputs.package-mode }}
+        run: vendor/bin/pest --compact
+
+      - name: Run tests (Pest)
+        if: ${{ inputs.package-mode }}
+        run: composer test
+
+      - name: Audit dependencies for advisories
+        run: composer audit
