@@ -102,10 +102,22 @@ jobs:
         # Passport's OAuth keys are gitignored, so a fresh checkout has none and
         # any test that boots the passport guard dies with "Invalid key
         # supplied". These are throwaway CI keys.
+        #
+        # Not every app in the fleet installs Passport, and `passport:keys` on
+        # an app without it fails with "command is not defined" — so the step
+        # asks artisan whether the command exists rather than assuming. It asks
+        # artisan, not composer.lock, because the command's existence is the
+        # property that actually matters, and it announces which branch it took:
+        # a silent skip here would be indistinguishable from a broken install.
         run: |
           cp .env.example .env
           php artisan key:generate
-          php artisan passport:keys --no-interaction
+          if php artisan list --raw | grep -q '^passport:keys'; then
+            echo "Passport is installed — generating throwaway CI keys."
+            php artisan passport:keys --no-interaction
+          else
+            echo "Passport is not installed here — no keys needed."
+          fi
 
       - name: Set up Node 22
         if: ${{ inputs.build-assets }}
