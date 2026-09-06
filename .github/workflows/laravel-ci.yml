@@ -85,12 +85,17 @@ jobs:
         run: composer install --no-interaction --prefer-dist --no-progress
 
       - name: Check formatting (Pint)
+        # The path is load-bearing. Bare `pint --test` was observed reporting a
+        # 495-file tree clean while `pint --test .` correctly flagged
+        # violations in it (academy_builder, recorded in
+        # jims_dev_way/playbooks/operations.md) — a green signal that isn't.
+        # Always pass an explicit path.
         if: ${{ ! inputs.package-mode }}
-        run: vendor/bin/pint --test
+        run: vendor/bin/pint --test .
 
       - name: Check formatting (Pint)
         if: ${{ inputs.package-mode }}
-        run: composer pint -- --test
+        run: composer pint -- --test .
 
       - name: Prepare the test environment
         if: ${{ ! inputs.package-mode }}
@@ -123,5 +128,22 @@ jobs:
         if: ${{ inputs.package-mode }}
         run: composer test
 
-      - name: Audit dependencies for advisories
+      - name: Audit Composer dependencies for advisories
         run: composer audit
+
+      - name: Audit npm dependencies for advisories
+        # composer audit guards the PHP channel only. The npm channel was found
+        # entirely unguarded across the fleet (academy_builder carried 1
+        # critical + 3 high advisories behind a green CI run) — WO-027's
+        # measurement, closed here. Blocking, like composer audit.
+        #
+        # Conditional because not every app has a front end, and it reads the
+        # lock file rather than node_modules, so it needs no install step and
+        # runs whether or not build-assets was requested. The runner's
+        # preinstalled Node provides npm when setup-node did not.
+        #
+        # --audit-level=high: moderate/low npm advisories are overwhelmingly in
+        # the build-time dependency tree, which never reaches a browser or a
+        # server; blocking on them would train the fleet to ignore a red run.
+        if: ${{ hashFiles('package-lock.json') != '' }}
+        run: npm audit --audit-level=high
