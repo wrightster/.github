@@ -39,6 +39,14 @@ on:
           because a library correctly does not commit composer.lock.
         type: boolean
         default: false
+      test-runner:
+        description: >-
+          Which binary runs the suite: 'pest' (the standard, and the default)
+          or 'phpunit'. Only bcl-demo-system needs the latter — it predates
+          the Pest standard and has no pestphp/pest to run. Converging it onto
+          Pest would retire this input.
+        type: string
+        default: pest
 
 permissions:
   contents: read
@@ -133,8 +141,12 @@ jobs:
           npm run build
 
       - name: Run tests (Pest)
-        if: ${{ ! inputs.package-mode }}
+        if: ${{ ! inputs.package-mode && inputs.test-runner == 'pest' }}
         run: vendor/bin/pest --compact
+
+      - name: Run tests (PHPUnit)
+        if: ${{ ! inputs.package-mode && inputs.test-runner == 'phpunit' }}
+        run: vendor/bin/phpunit
 
       - name: Run tests (Pest)
         if: ${{ inputs.package-mode }}
