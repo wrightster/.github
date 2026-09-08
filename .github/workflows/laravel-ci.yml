@@ -17,6 +17,17 @@ name: laravel-ci
 #
 # Callers also carry a weekly schedule: trigger, because push-only CI never
 # warns an untouched repo about a new advisory.
+#
+# Every input here is opt-in and every step it adds is gated on it, because
+# callers reference @main: a caller that passes nothing must run exactly the
+# pipeline it ran before the input landed, or one commit reddens sixteen repos.
+#
+# Passing secrets: a caller that uses `extra-checkouts` must add
+# `secrets: inherit` to its job. There is no way to declare per-repo deploy-key
+# secrets statically here — their names differ per caller and a GitHub deploy
+# key is single-repo, permanently (WO-041) — so the checkout step resolves each
+# entry's `secret` name against the inherited secrets at run time. Callers that
+# use no extra checkouts need pass nothing.
 
 on:
   workflow_call:
@@ -47,6 +58,57 @@ on:
           Pest would retire this input.
         type: string
         default: pest
+      database:
+        description: >-
+          Which database server the suite needs: '' (the default — none, the
+          fleet's phpunit.xml files pin sqlite :memory:), 'mysql' or 'pgsql'.
+          Set it and this workflow starts the matching service container,
+          creates the test database, exports DB_* for the rest of the job, and
+          runs `php artisan migrate --force` before the suite.
+
+          academy_builder needs 'mysql': its phpunit.xml pins the mysql
+          connection and TenantServiceProvider::boot() queries `tenants` while
+          the application boots — before RefreshDatabase gets a chance to
+          migrate — so the schema has to exist before Pest starts. ptv2 needs it
+          for a different reason: 29 MySQL views in its schema of record
+          (database/schema/mysql-schema.sql) are not something sqlite can build.
+          'pgsql' exists for mentor_chat, whose bespoke workflow runs
+          pgvector/pgvector:pg17, and has no caller yet — the first one should
+          expect to iterate on it.
+
+          The caller's side of the contract is one line: .env.example must set
+          DB_CONNECTION to the same driver, because .env.example IS CI's .env
+          (the prepare step copies it) and Laravel's immutable dotenv means the
+          file, not this workflow, decides the default connection. Host, port,
+          user and password are this workflow's to inject — they are properties
+          of the service container it owns, not of the app — and the test
+          database name comes from the app's phpunit.xml, which stays the
+          authority for it. Get DB_CONNECTION wrong and the failure is a bare
+          connection-refused with nothing naming the mismatch.
+        type: string
+        default: ''
+      extra-checkouts:
+        description: >-
+          Private repositories to check out alongside the application, as a
+          JSON array of {"repo", "path", "secret"} objects — `repo` in
+          owner/name form, `path` relative to the workspace, `secret` the name
+          of the caller's repo secret holding a read-only deploy key's private
+          half.
+
+          academy_builder needs this: every learner-facing Blade view lives in
+          one of nine ab_theme_* repos, gitignored there and deployed out of
+          band, and the app registers the directory as a view location at
+          runtime. Without them 19 tests fail across auth, magic-link, password
+          and helper-widget rendering, and VideoPosterTest's theme dataset
+          skips half its cases.
+
+          Requires `secrets: inherit` on the calling job. Entries are cloned
+          shallow, in order, after the application checkout — which is
+          load-bearing: actions/checkout cleans the workspace with
+          `git clean -ffdx`, so anything landed before it and gitignored by the
+          app is deleted.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -56,18 +118,96 @@ jobs:
     name: Lint, test, audit
     runs-on: ubuntu-latest
 
+    # Service containers cannot carry an `if:`, so the gate is the image name:
+    # an empty image is a service the runner skips. That makes `database: ''`
+    # — the fleet default — start no container at all, which is what keeps
+    # every existing caller's run identical.
+    services:
+      mysql:
+        image: ${{ inputs.database == 'mysql' && 'mysql:8' || '' }}
+        env:
+          # Fixed and documented, per the input above: the service belongs to
+          # this workflow, so its credentials do too. No MYSQL_DATABASE — the
+          # database name comes from the app's phpunit.xml and is created below.
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+      postgres:
+        # pgvector rather than plain postgres because the only app on this arm
+        # (mentor_chat) stores embeddings; the extension is a superset.
+        image: ${{ inputs.database == 'pgsql' && 'pgvector/pgvector:pg17' || '' }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
+
+      - name: Check out the extra private repositories
+        # One shell step rather than a stack of actions/checkout blocks:
+        # Actions has no way to loop steps, and the alternative — nine
+        # near-identical blocks indexed out of fromJSON() — would cap the list
+        # and be the drift this file exists to prevent. The clone is what
+        # actions/checkout's ssh-key path does by hand: a mode-600 key file, a
+        # scoped GIT_SSH_COMMAND, IdentitiesOnly so a runner with more than one
+        # key cannot offer the wrong identity first (WO-041's lesson), depth 1.
+        if: ${{ inputs.extra-checkouts != '' }}
+        env:
+          EXTRA_CHECKOUTS: ${{ inputs.extra-checkouts }}
+          # The inherited secrets, as JSON, because `secret` names are data in
+          # the input and cannot be written into an expression here.
+          CALLER_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          mapfile -t entries < <(jq -c '.[]' <<< "$EXTRA_CHECKOUTS")
+          echo "extra-checkouts names ${#entries[@]} repositories."
+          for entry in "${entries[@]}"; do
+            repo=$(jq -r '.repo' <<< "$entry")
+            path=$(jq -r '.path' <<< "$entry")
+            secret=$(jq -r '.secret' <<< "$entry")
+            key=$(jq -r --arg name "$secret" '.[$name] // empty' <<< "$CALLER_SECRETS")
+            if [ -z "$key" ]; then
+              echo "::error::extra-checkouts asks for secret '$secret' (repository $repo) and the calling job passed no such secret. Callers using extra-checkouts must set 'secrets: inherit'."
+              exit 1
+            fi
+            keyfile="$RUNNER_TEMP/extra-checkout.key"
+            printf '%s\n' "$key" > "$keyfile"
+            chmod 600 "$keyfile"
+            echo "Checking out $repo into $path"
+            GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+              git clone --depth 1 --quiet "git@github.com:${repo}.git" "$path"
+            rm -f "$keyfile"
+          done
 
       - name: Set up PHP 8.4
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
-          # intl/zip are required by vendor packages; sqlite backs the test
-          # suite (phpunit.xml pins sqlite :memory:); gd covers the apps that do
-          # image handling. One list fleet-wide, so no repo drifts on its own.
-          extensions: intl, zip, gd, pdo_sqlite, sqlite3
+          # intl/zip are required by vendor packages; sqlite backs most of the
+          # fleet's test suites (phpunit.xml pins sqlite :memory:); gd covers
+          # the apps that do image handling, and exif comes with it —
+          # spatie/laravel-medialibrary, spatie/image and intervention/image all
+          # declare ext-exif, so composer install fails its platform check
+          # without it. pdo_mysql and pdo_pgsql serve the `database` input.
+          #
+          # ONE list fleet-wide, unconditionally, even though no app uses all of
+          # it: an extension nobody loads costs seconds, while an extension list
+          # that varies per caller is exactly the drift this file exists to
+          # prevent.
+          extensions: intl, zip, gd, exif, pdo_sqlite, sqlite3, pdo_mysql, pdo_pgsql
           coverage: none
           tools: composer:v2
 
@@ -126,6 +266,90 @@ jobs:
           else
             echo "Passport is not installed here — no keys needed."
           fi
+
+      - name: Prepare the test database
+        # Gated on the input and loud about what it found, like the Passport
+        # step above: a silent skip here would look exactly like a working
+        # database.
+        #
+        # phpunit.xml is the authority for the test database name — it is what
+        # the suite will actually connect to, and on both mysql callers it
+        # deliberately differs from the .env.example value a developer copies
+        # for local work (neurostar_test vs laravel; projects_bcl_test vs
+        # projects_bcl_v2). Reading it here and exporting it means `migrate` and
+        # the suite cannot end up on different databases, which is the failure
+        # this step is easiest to get wrong in.
+        #
+        # The database is created over PDO rather than with a mysql/psql client,
+        # because pdo_mysql and pdo_pgsql are installed above and a client
+        # binary on the runner image is not something to depend on.
+        if: ${{ inputs.database != '' }}
+        env:
+          CI_DATABASE: ${{ inputs.database }}
+        run: |
+          set -euo pipefail
+
+          name=$(php -r '
+            $xml = @simplexml_load_file("phpunit.xml");
+            foreach (($xml->php->env ?? []) as $env) {
+              if ((string) $env["name"] === "DB_DATABASE") { echo (string) $env["value"]; exit; }
+            }
+          ')
+
+          if [ -n "$name" ]; then
+            echo "Test database named by phpunit.xml: $name"
+          elif [ -f .env ] && grep -qE '^DB_DATABASE=' .env; then
+            name=$(grep -E '^DB_DATABASE=' .env | head -1 | cut -d= -f2- | sed 's/^["'"'"']//; s/["'"'"']$//')
+            echo "phpunit.xml names no DB_DATABASE — falling back to .env: $name"
+          else
+            echo "::error::database: $CI_DATABASE was requested but neither phpunit.xml nor .env names a DB_DATABASE, so there is no database to create."
+            exit 1
+          fi
+
+          if [ "$CI_DATABASE" = 'mysql' ]; then
+            host=127.0.0.1; port=3306; user=root; pass=root
+          elif [ "$CI_DATABASE" = 'pgsql' ]; then
+            host=127.0.0.1; port=5432; user=postgres; pass=postgres
+          else
+            echo "::error::database: '$CI_DATABASE' is not a value this workflow knows. Use '', 'mysql' or 'pgsql'."
+            exit 1
+          fi
+
+          DB_NAME="$name" DB_DRIVER="$CI_DATABASE" DB_USER="$user" DB_PASS="$pass" DB_PORT_="$port" php -r '
+            $name = getenv("DB_NAME");
+            $driver = getenv("DB_DRIVER");
+            $user = getenv("DB_USER");
+            $pass = getenv("DB_PASS");
+            $port = getenv("DB_PORT_");
+            if ($driver === "mysql") {
+              $pdo = new PDO("mysql:host=127.0.0.1;port={$port}", $user, $pass);
+              $pdo->exec("CREATE DATABASE IF NOT EXISTS `" . $name . "`");
+            } else {
+              $pdo = new PDO("pgsql:host=127.0.0.1;port={$port};dbname=postgres", $user, $pass);
+              $exists = $pdo->query("SELECT 1 FROM pg_database WHERE datname = " . $pdo->quote($name))->fetchColumn();
+              if (! $exists) { $pdo->exec("CREATE DATABASE \"" . $name . "\""); }
+            }
+            echo "Created (or found) the {$driver} database {$name}.\n";
+          '
+
+          {
+            echo "DB_CONNECTION=$CI_DATABASE"
+            echo "DB_HOST=$host"
+            echo "DB_PORT=$port"
+            echo "DB_DATABASE=$name"
+            echo "DB_USERNAME=$user"
+            echo "DB_PASSWORD=$pass"
+          } >> "$GITHUB_ENV"
+
+      - name: Migrate the test database
+        # Before the suite, not inside it: an app whose service providers query
+        # the database during boot (academy_builder's tenant lookup) never
+        # reaches RefreshDatabase. Harmless for the apps that do migrate
+        # themselves — they will just find the schema already there.
+        if: ${{ inputs.database != '' }}
+        run: |
+          echo "Building the schema on the ${{ inputs.database }} service before the suite runs."
+          php artisan migrate --force
 
       - name: Set up Node 22
         if: ${{ inputs.build-assets }}
