@@ -22,12 +22,25 @@ name: laravel-ci
 # callers reference @main: a caller that passes nothing must run exactly the
 # pipeline it ran before the input landed, or one commit reddens sixteen repos.
 #
-# Passing secrets: a caller that uses `extra-checkouts` must add
-# `secrets: inherit` to its job. There is no way to declare per-repo deploy-key
-# secrets statically here — their names differ per caller and a GitHub deploy
-# key is single-repo, permanently (WO-041) — so the checkout step resolves each
-# entry's `secret` name against the inherited secrets at run time. Callers that
-# use no extra checkouts need pass nothing.
+# Passing secrets: a caller that uses `extra-checkouts` passes
+# `caller_secrets: ${{ toJSON(secrets) }}`, and the checkout step resolves each
+# entry's `secret` name against that JSON at run time. The names cannot be
+# declared statically here — they differ per caller, because a GitHub deploy key
+# is single-repo permanently (WO-041), so nine themes mean nine secrets.
+#
+# `secrets: inherit` does NOT work for this, which is worth writing down: the
+# inherited secrets are reachable by literal name inside a called workflow, but
+# `toJSON(secrets)` there serializes only the declared ones — it came back
+# holding github_token alone, and every lookup missed (academy_builder run
+# 34271419501). Evaluated in the CALLER, where `secrets` is the repo's own
+# secret set, `toJSON(secrets)` returns everything. So the caller does the
+# serializing and hands the result over as one declared secret.
+#
+# That grant is the caller's whole secret set, the same breadth `secrets:
+# inherit` would have given. A caller holding secrets unrelated to its
+# checkouts is handing those over too — worth a thought before adding this to a
+# repo whose secrets are not all deploy keys. Callers with no extra checkouts
+# pass nothing.
 
 on:
   workflow_call:
@@ -102,13 +115,22 @@ on:
           and helper-widget rendering, and VideoPosterTest's theme dataset
           skips half its cases.
 
-          Requires `secrets: inherit` on the calling job. Entries are cloned
+          Requires the caller_secrets secret below. Entries are cloned
           shallow, in order, after the application checkout — which is
           load-bearing: actions/checkout cleans the workspace with
           `git clean -ffdx`, so anything landed before it and gitignored by the
           app is deleted.
         type: string
         default: ''
+    secrets:
+      caller_secrets:
+        description: >-
+          The calling repository's secrets as JSON: the caller passes its own
+          toJSON(secrets) expression. Required only when extra-checkouts is
+          set — it is how the deploy key each entry names reaches this
+          workflow. The note at the top of this file has the literal form to
+          copy, and why `secrets: inherit` cannot do this job.
+        required: false
 
 permissions:
   contents: read
@@ -167,11 +189,21 @@ jobs:
         if: ${{ inputs.extra-checkouts != '' }}
         env:
           EXTRA_CHECKOUTS: ${{ inputs.extra-checkouts }}
-          # The inherited secrets, as JSON, because `secret` names are data in
-          # the input and cannot be written into an expression here.
-          CALLER_SECRETS: ${{ toJSON(secrets) }}
+          # Serialized by the caller, because `secret` names are data in the
+          # input and cannot be written into an expression here.
+          CALLER_SECRETS: ${{ secrets.caller_secrets }}
         run: |
           set -euo pipefail
+
+          if [ -z "${CALLER_SECRETS:-}" ]; then
+            echo "::error::extra-checkouts is set but no caller_secrets arrived. The calling job must pass its own toJSON(secrets) as the caller_secrets secret — see the header of wrightster/.github laravel-ci.yml."
+            exit 1
+          fi
+
+          # Names, never values: this is the diagnostic that would have found
+          # the secrets: inherit dead end in one run instead of two.
+          echo "caller_secrets carries: $(jq -r 'keys | join(", ")' <<< "$CALLER_SECRETS")"
+
           mapfile -t entries < <(jq -c '.[]' <<< "$EXTRA_CHECKOUTS")
           echo "extra-checkouts names ${#entries[@]} repositories."
           for entry in "${entries[@]}"; do
@@ -180,7 +212,7 @@ jobs:
             secret=$(jq -r '.secret' <<< "$entry")
             key=$(jq -r --arg name "$secret" '.[$name] // empty' <<< "$CALLER_SECRETS")
             if [ -z "$key" ]; then
-              echo "::error::extra-checkouts asks for secret '$secret' (repository $repo) and the calling job passed no such secret. Callers using extra-checkouts must set 'secrets: inherit'."
+              echo "::error::extra-checkouts asks for secret '$secret' (repository $repo) and caller_secrets holds no such name."
               exit 1
             fi
             keyfile="$RUNNER_TEMP/extra-checkout.key"
