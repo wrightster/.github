@@ -128,9 +128,12 @@ on:
           job watch `released`. Either way the artifact this input produces --
           a ref that means "tested" -- outlives the thing that consumes it.
 
-          Requires `contents: write` on the CALLING job (a called workflow's
-          token can never exceed its caller's). Only the release job takes it;
-          the test job below stays read-only.
+          Requires `contents: write` on the CALLING job -- a called workflow's
+          token can never exceed its caller's, and this workflow deliberately
+          does not request the escalation itself (asking for it would fail every
+          caller's run at startup, whether or not they set this input; see the
+          release job's note). The test job pins itself to `contents: read`, so
+          the write reaches the release job and nothing else.
         type: boolean
         default: false
       extra-checkouts:
@@ -165,8 +168,9 @@ on:
           copy, and why `secrets: inherit` cannot do this job.
         required: false
 
-permissions:
-  contents: read
+# NO workflow-level permissions block, and this is load-bearing -- see the
+# release job's note. Each job below declares what it needs, or declares
+# nothing and takes what the caller granted it.
 
 jobs:
   ci:
@@ -491,12 +495,26 @@ jobs:
     if: ${{ inputs.release-on-green && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
 
-    # The only write grant in this workflow, scoped to the only job that needs
-    # it. It is still capped by the caller: a called workflow's GITHUB_TOKEN can
-    # never exceed the calling job's permissions, so a caller that forgets
-    # `contents: write` gets a legible 403 here rather than a silent no-op.
-    permissions:
-      contents: write
+    # NO permissions block here, deliberately, and it took a red fleet to learn
+    # why: **GitHub validates a called workflow's job-level `permissions` against
+    # the caller's grant when the run STARTS, not when the job's `if:` is
+    # evaluated.** A `permissions: contents: write` on this job therefore asks
+    # for an escalation on behalf of EVERY caller -- including the fourteen whose
+    # ci.yml says `permissions: contents: read` and which never set
+    # release-on-green. Those runs die with `startup_failure` before a single job
+    # is created: no logs, no annotation, no job list, and the `if: false` that
+    # would have skipped this job never gets a chance to matter. WO-045's two
+    # WO-020 pre-flight dispatches (assay and academy_builder, plain callers on
+    # @main) is the only reason this was found before someone's push found it.
+    #
+    # So the scoping is done from the other side: this job declares nothing and
+    # inherits whatever the calling job granted, while the `ci` job above pins
+    # itself to `contents: read`. Net effect is identical -- write reaches only
+    # this job -- and a caller that passes nothing requests nothing.
+    #
+    # A caller that sets release-on-green must therefore grant
+    # `contents: write` on its calling job. If it forgets, this job runs with a
+    # read-only token and the ref API returns 403, which the step below reports.
 
     steps:
       - name: Fast-forward released to the tested commit
