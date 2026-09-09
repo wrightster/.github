@@ -100,6 +100,39 @@ on:
           connection-refused with nothing naming the mismatch.
         type: string
         default: ''
+      release-on-green:
+        description: >-
+          Fast-forward a `released` branch to the tested commit after every
+          green push to main, and nothing else. Opt-in, default off; a caller
+          that does not set it gets no release job at all.
+
+          This is the GATE the fleet has never had. On Ploi-hosted apps CI has
+          only ever been detection -- Ploi ships on push regardless of what the
+          suite says, and ignores [skip ci] -- so a red push reached production
+          minutes before anyone knew. With this input on, `main` is what
+          developers push and `released` is what production pulls, and the only
+          thing that moves `released` is a run of this workflow in which every
+          job above passed.
+
+          The move is FAST-FORWARD ONLY, enforced twice: an explicit ancestry
+          check for a legible error message, and `force: false` on GitHub's own
+          ref API, which is the authority. A diverged `released` is a hard
+          failure and never a forced push -- divergence means someone moved
+          production's pointer by hand, and quietly overwriting that is how you
+          lose the evidence of it.
+
+          Deploying the branch is somebody else's job. ptv2 (the pilot, WO-045)
+          pulls it on a five-minute systemd timer using a read-only deploy key
+          the box already had, so no credential is handed to this runner and
+          nothing inbound is opened. A Coolify app would instead have its deploy
+          job watch `released`. Either way the artifact this input produces --
+          a ref that means "tested" -- outlives the thing that consumes it.
+
+          Requires `contents: write` on the CALLING job (a called workflow's
+          token can never exceed its caller's). Only the release job takes it;
+          the test job below stays read-only.
+        type: boolean
+        default: false
       extra-checkouts:
         description: >-
           Private repositories to check out alongside the application, as a
@@ -139,6 +172,12 @@ jobs:
   ci:
     name: Lint, test, audit
     runs-on: ubuntu-latest
+
+    # Stated at job level, not left to the workflow-level default above, because
+    # the release job below needs `contents: write` and job-level permissions are
+    # what keep that grant off this job. Nothing here writes to the repository.
+    permissions:
+      contents: read
 
     # Service containers cannot carry an `if:`, so the gate is the image name:
     # an empty image is a service the runner skips. That makes `database: ''`
@@ -427,3 +466,88 @@ jobs:
         # server; blocking on them would train the fleet to ignore a red run.
         if: ${{ hashFiles('package-lock.json') != '' }}
         run: npm audit --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  # The release gate. WO-045.
+  #
+  # `needs: ci` is the whole mechanism: GitHub will not start this job unless
+  # every job above it succeeded, so a red suite, a Pint violation, a composer
+  # advisory or an npm advisory each stop `released` from moving -- which is
+  # precisely what Ploi's trigger could not do.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Fast-forward released to the tested commit
+    needs: ci
+    # Four conditions, each load-bearing:
+    #   inputs.release-on-green -- opt-in, so the fifteen callers that pass
+    #     nothing run exactly the pipeline they ran before this job existed.
+    #   github.event_name == 'push' -- a workflow_dispatch or the weekly
+    #     schedule: run is a green signal about a tree, not a decision to ship
+    #     it. Releases follow pushes.
+    #   github.ref == 'refs/heads/main' -- a green feature branch is not a
+    #     release. This alone is why a red branch push cannot move `released`,
+    #     independently of `needs:`.
+    #   !cancelled() is deliberately NOT used: a cancelled run has not passed.
+    if: ${{ inputs.release-on-green && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+
+    # The only write grant in this workflow, scoped to the only job that needs
+    # it. It is still capped by the caller: a called workflow's GITHUB_TOKEN can
+    # never exceed the calling job's permissions, so a caller that forgets
+    # `contents: write` gets a legible 403 here rather than a silent no-op.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Fast-forward released to the tested commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_REF: released
+          TESTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # No checkout and no `git push`: the ref move is done through GitHub's
+          # ref API, whose `force: false` is a SERVER-side fast-forward check.
+          # A local `git push` would enforce the same rule, but only after
+          # cloning the repository to do it, and the failure would arrive as
+          # git's "rejected: non-fast-forward" rather than as something this job
+          # can explain.
+          if current="$(gh api "repos/${REPO}/git/ref/heads/${RELEASE_REF}" --jq .object.sha 2>/dev/null)"; then
+            echo "released is currently ${current}"
+          else
+            current=''
+            echo "There is no ${RELEASE_REF} branch yet -- this run creates it."
+          fi
+
+          if [ -z "${current}" ]; then
+            gh api -X POST "repos/${REPO}/git/refs" \
+              -f "ref=refs/heads/${RELEASE_REF}" \
+              -f "sha=${TESTED_SHA}" --jq .object.sha
+            echo "::notice::Created ${RELEASE_REF} at ${TESTED_SHA}."
+            exit 0
+          fi
+
+          if [ "${current}" = "${TESTED_SHA}" ]; then
+            echo "::notice::${RELEASE_REF} is already at ${TESTED_SHA} -- nothing to do."
+            exit 0
+          fi
+
+          # Ancestry first, purely so the error message can say what is wrong.
+          # `force: false` below is what actually refuses; this check is what
+          # makes a refusal readable at 2am. base...head with base=released:
+          # "ahead" means the tested commit is a descendant of released, which
+          # is the only shape a fast-forward can have.
+          status="$(gh api "repos/${REPO}/compare/${current}...${TESTED_SHA}" --jq .status)"
+          echo "released..tested = ${status}"
+
+          if [ "${status}" != 'ahead' ]; then
+            echo "::error::${RELEASE_REF} (${current}) and the tested commit (${TESTED_SHA}) are '${status}', not 'ahead' -- this is not a fast-forward, so nothing was moved. A diverged released branch means production's pointer was moved outside this pipeline; find out what did that before forcing anything. Recover by hand once you know: git push --force-with-lease is a decision, not a retry."
+            exit 1
+          fi
+
+          gh api -X PATCH "repos/${REPO}/git/refs/heads/${RELEASE_REF}" \
+            -f "sha=${TESTED_SHA}" \
+            -F force=false --jq .object.sha
+          echo "::notice::Fast-forwarded ${RELEASE_REF} from ${current} to ${TESTED_SHA}."
