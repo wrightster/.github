@@ -452,7 +452,20 @@ jobs:
         run: composer test
 
       - name: Audit Composer dependencies for advisories
-        run: composer audit
+        # `--abandoned=report`, and it is a correction rather than a relaxation.
+        # Composer 2.10's `audit` FAILS on an abandoned package by default, which
+        # has nothing to do with a security advisory: jwrg_office pulls
+        # doctrine/annotations transitively through microsoft/kiota-abstractions,
+        # so with zero advisories outstanding its audit still exited 1 and no
+        # caller could ever go green while a transitive dependency it does not
+        # control is marked abandoned (WO-057).
+        #
+        # Abandonment is a maintenance signal and belongs in the opportunistic
+        # upgrade rule, not in the gate that decides whether production ships.
+        # Advisories still fail this step, which is what the CI standard says
+        # this step is for; `report` keeps the abandoned list printed, so nothing
+        # becomes invisible.
+        run: composer audit --abandoned=report
 
       - name: Audit npm dependencies for advisories
         # composer audit guards the PHP channel only. The npm channel was found
