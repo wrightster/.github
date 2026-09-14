@@ -100,6 +100,31 @@ on:
           connection-refused with nothing naming the mismatch.
         type: string
         default: ''
+      system-packages:
+        description: >-
+          Extra Debian packages to install on the runner before anything else
+          needs them, as a space-separated list for `apt-get install`. Default
+          '' installs nothing and adds no step, so the fleet's other callers
+          run exactly the pipeline they ran before this input landed.
+
+          fileclerk needs 'poppler-utils': its AnalyzerTest extracts text from
+          REAL PDF fixtures by shelling out to `pdftotext`, deliberately rather
+          than through a stubbed extractor ("a faked extractor would only prove
+          we can parse our own fake"), and there is no skip guard — on a
+          missing binary the analyzer returns Analysis::none() and the
+          `toBe('pdftotext')` expectation fails. poppler is not in the
+          ubuntu-latest runner image, so without this input a conversion that
+          changed nothing else would turn a green suite red (WO-043).
+
+          Scope discipline: this is for test-environment BINARIES the runner
+          image lacks, not for PHP extensions (the setup-php list above owns
+          those, and stays ONE unconditional list fleet-wide) and not for
+          application dependencies. The value is interpolated into a shell
+          command, so it is a list of package names and nothing else —
+          callers are repositories in these two orgs, and the workflow file
+          is the trust boundary, not this string.
+        type: string
+        default: ''
       release-on-green:
         description: >-
           Fast-forward a `released` branch to the tested commit after every
@@ -285,6 +310,22 @@ jobs:
           extensions: intl, zip, gd, exif, pdo_sqlite, sqlite3, pdo_mysql, pdo_pgsql
           coverage: none
           tools: composer:v2
+
+      - name: Install system packages
+        # Gated on the input, and loud about what it installed — a silent skip
+        # here would look exactly like a working binary, and the failure it
+        # produces surfaces much later as a confusing test assertion rather
+        # than as a missing package.
+        #
+        # Before composer and well before the suite, because what this installs
+        # is a binary the tests shell out to. `apt-get update` is not optional:
+        # the runner image ships stale package lists and `install` alone fails
+        # with 404s on moved pool files.
+        if: ${{ inputs.system-packages != '' }}
+        run: |
+          echo "Installing system packages: ${{ inputs.system-packages }}"
+          sudo apt-get update
+          sudo apt-get install -y ${{ inputs.system-packages }}
 
       - name: Resolve the Composer cache directory
         id: composer-cache
@@ -481,8 +522,67 @@ jobs:
         # --audit-level=high: moderate/low npm advisories are overwhelmingly in
         # the build-time dependency tree, which never reaches a browser or a
         # server; blocking on them would train the fleet to ignore a red run.
+        #
+        # ON FAILURE, NAME THE ADVISORY. npm's human-readable report is not a
+        # complete list of what failed this gate: on bcl-demo-system it printed
+        # only the moderate `esbuild` subtree while the HIGH that actually
+        # exited 1 was on `vite` and appeared nowhere in the output, so anyone
+        # triaging the red run from the Actions log alone reached for the wrong
+        # package (WO-043, discovery 4). `npm audit --json` is the authority,
+        # and the block below is only ever reached when the gate has already
+        # failed — a green run prints exactly what it printed before, which is
+        # what lets this land on @main under the byte-identical rule.
         if: ${{ hashFiles('package-lock.json') != '' }}
-        run: npm audit --audit-level=high
+        run: |
+          set +e
+          npm audit --audit-level=high
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+
+          report="$RUNNER_TEMP/npm-audit.json"
+          npm audit --audit-level=high --json > "$report" 2>/dev/null || true
+
+          echo
+          echo "The report above can omit the advisory that failed this gate. From npm audit --json,"
+          echo "every finding at high or critical severity - these are what exited $status:"
+          echo
+
+          jq -r '
+            .vulnerabilities // {}
+            | to_entries[]
+            | .value as $p
+            | select($p.severity == "high" or $p.severity == "critical")
+            | (
+                "  \($p.severity | ascii_upcase)  \($p.name)  (installed range \($p.range // "?"))"
+                + (if ($p.fixAvailable | type) == "object"
+                   then "  -> fix: \($p.fixAvailable.name)@\($p.fixAvailable.version)\(if $p.fixAvailable.isSemVerMajor then " (MAJOR - escalate, do not bump silently)" else "" end)"
+                   elif $p.fixAvailable == true then "  -> fix available"
+                   else "  -> NO FIX AVAILABLE" end)
+              ),
+              (
+                ([$p.via[]? | select(type == "object") | select(.severity == "high" or .severity == "critical")]
+                 | if length == 0
+                   then ["      (no high/critical advisory names this package directly; it is high by way of: \([$p.via[]? | select(type == "string")] | join(", ")))"]
+                   else [.[] | "      \(.severity | ascii_upcase)  \(.url // "no advisory url")  \(.title // "")"]
+                   end)[]
+              )
+          ' "$report" 2>/dev/null || echo "  (could not parse the JSON report - the raw output is in the group below)"
+
+          echo
+          echo "Fix on the installed major's patched line with an explicit ~x.y.z constraint."
+          echo "Never 'npm audit fix --force'. If the minimum version carrying the fix crosses"
+          echo "a major, that is an escalation with a named upgrade order, not a silent bump"
+          echo "(jims_dev_way/playbooks/deployment.md, advisory response)."
+
+          echo "::group::npm audit --audit-level=high --json (the authority)"
+          cat "$report"
+          echo "::endgroup::"
+
+          exit "$status"
 
   # ---------------------------------------------------------------------------
   # The release gate. WO-045.
