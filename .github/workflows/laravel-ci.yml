@@ -71,6 +71,30 @@ on:
           Pest would retire this input.
         type: string
         default: pest
+      pint-blocking:
+        description: >-
+          Whether a Pint violation fails the run. Default true, and it stays
+          true for every repository written to the standard. false exists for
+          one case: a LEGACY tree adopted as-is from a production box
+          (IT-INFRA-0086, ia-watch), where the adoption must be byte-faithful
+          to what production runs and formatting is a later, separate order.
+          Pint still runs and its step still reports red on the run page
+          (continue-on-error), so the violations stay visible; only the job
+          conclusion ignores them. A caller setting false should say why and
+          until when, in a comment beside the input.
+        type: boolean
+        default: true
+      npm-audit-blocking:
+        description: >-
+          Whether a high/critical npm advisory fails the run. Default true.
+          false has the same single purpose as pint-blocking's: an adopted
+          legacy tree whose npm fix would change the bundle users receive,
+          which cannot happen in the adoption order itself (IT-INFRA-0086).
+          The step still runs and still prints the advisory report; the
+          caller records a dated acceptance (POAM), because a code comment is
+          not an acceptance (WO-043).
+        type: boolean
+        default: true
       database:
         description: >-
           Which database server the suite needs: '' (the default — none, the
@@ -355,6 +379,7 @@ jobs:
         # jims_dev_way/playbooks/operations.md) — a green signal that isn't.
         # Always pass an explicit path.
         if: ${{ ! inputs.package-mode }}
+        continue-on-error: ${{ ! inputs.pint-blocking }}
         run: vendor/bin/pint --test .
 
       - name: Check formatting (Pint)
@@ -533,6 +558,7 @@ jobs:
         # failed — a green run prints exactly what it printed before, which is
         # what lets this land on @main under the byte-identical rule.
         if: ${{ hashFiles('package-lock.json') != '' }}
+        continue-on-error: ${{ ! inputs.npm-audit-blocking }}
         run: |
           set +e
           npm audit --audit-level=high
