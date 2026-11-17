@@ -95,6 +95,21 @@ on:
           not an acceptance (WO-043).
         type: boolean
         default: true
+      npm-audit-accepted:
+        description: >-
+          High/critical npm advisories this caller accepts, each until a date.
+          Default '' (none), which runs the npm audit step exactly as before.
+          One entry per line, in exactly this form:
+          `GHSA-xxxx-xxxx-xxxx until YYYY-MM-DD # POAM-NNN`.
+          The npm twin of composer's config.audit.ignore, for an advisory
+          with no fixed version. Every entry needs its own dated POAM line
+          (WO-043: a code comment is not an acceptance). The gate passes only
+          when every high/critical advisory in the lock is listed here and in
+          date; it fails on any other advisory, on an entry whose date has
+          passed (UTC) and on a malformed entry. An entry that matches nothing
+          in the lock warns, so it can be removed. IT-INFRA-0145.
+        type: string
+        default: ''
       database:
         description: >-
           Which database server the suite needs: '' (the default — none, the
@@ -557,7 +572,7 @@ jobs:
         # and the block below is only ever reached when the gate has already
         # failed — a green run prints exactly what it printed before, which is
         # what lets this land on @main under the byte-identical rule.
-        if: ${{ hashFiles('package-lock.json') != '' }}
+        if: ${{ hashFiles('package-lock.json') != '' && inputs.npm-audit-accepted == '' }}
         continue-on-error: ${{ ! inputs.npm-audit-blocking }}
         run: |
           set +e
@@ -609,6 +624,165 @@ jobs:
           echo "::endgroup::"
 
           exit "$status"
+
+      - name: Audit npm dependencies for advisories (dated acceptances)
+        # IT-INFRA-0145. The same gate as the step above, for a caller that sets
+        # npm-audit-accepted; exactly one of the two runs. npm has no native
+        # ignore list, so an advisory with no fixed version (picomatch
+        # GHSA-fc5q-39xc-vjpf, POAM-092) left the gate no answer but red
+        # forever or npm-audit-blocking: false, which goes blind to everything
+        # else. This step accepts named advisory ids, each until a date, and
+        # nothing more.
+        #
+        # Ids, never package names: an accepted picomatch ReDoS must not hide
+        # the next picomatch advisory. Ids come from the `via` OBJECTS of
+        # `npm audit --json`; a `via` STRING means the package is high only
+        # because of another package, whose own object already carries the id.
+        #
+        # Fails closed: a malformed entry, an impossible or past date (UTC), a
+        # report that will not parse, or a non-zero npm exit with no high or
+        # critical advisory to explain it all fail the step. A green run still
+        # prints every acceptance it relied on, and an entry that matched
+        # nothing warns so it can be removed. bash + jq only, pipefail on, and
+        # no gate command is piped through head or tail (playbook).
+        if: ${{ hashFiles('package-lock.json') != '' && inputs.npm-audit-accepted != '' }}
+        continue-on-error: ${{ ! inputs.npm-audit-blocking }}
+        shell: bash
+        env:
+          NPM_AUDIT_ACCEPTED: ${{ inputs.npm-audit-accepted }}
+        run: |
+          set -euo pipefail
+
+          today="$(date -u +%Y-%m-%d)"
+          accepted_tsv="$RUNNER_TEMP/npm-audit-accepted.tsv"
+          : > "$accepted_tsv"
+          entry_re='^(GHSA-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4})[[:space:]]+until[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]]*#[[:space:]]*(POAM-[0-9]+)$'
+          entries=0
+          problems=0
+
+          while IFS= read -r raw; do
+            line="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            case "$line" in
+              '' | '#'*) continue ;;
+            esac
+            entries=$((entries + 1))
+            if [[ ! "$line" =~ $entry_re ]]; then
+              echo "::error::npm-audit-accepted: malformed entry '$line'. The form is 'GHSA-xxxx-xxxx-xxxx until YYYY-MM-DD # POAM-NNN'. Correct it, or remove it."
+              problems=$((problems + 1))
+              continue
+            fi
+            id="${BASH_REMATCH[1]}"
+            until_date="${BASH_REMATCH[2]}"
+            poam="${BASH_REMATCH[3]}"
+            if [ "$(jq -rn --arg d "$until_date" '$d | strptime("%Y-%m-%d") | mktime | strftime("%Y-%m-%d")' 2>/dev/null || true)" != "$until_date" ]; then
+              echo "::error::npm-audit-accepted: '$line' has no such date as $until_date. Correct it, or remove it."
+              problems=$((problems + 1))
+              continue
+            fi
+            if [[ "$until_date" < "$today" ]]; then
+              echo "::error::npm-audit-accepted: $id expired on $until_date (today is $today UTC). Renew it in $poam and here, or remove it."
+              problems=$((problems + 1))
+              continue
+            fi
+            if cut -f1 "$accepted_tsv" | grep -qxF "$id"; then
+              echo "::error::npm-audit-accepted: $id is listed more than once. Keep one entry."
+              problems=$((problems + 1))
+              continue
+            fi
+            printf '%s\t%s\t%s\n' "$id" "$until_date" "$poam" >> "$accepted_tsv"
+          done <<< "$NPM_AUDIT_ACCEPTED"
+
+          if [ "$entries" -eq 0 ]; then
+            echo "::error::npm-audit-accepted is set but holds no entries. Remove the input, or add an entry."
+            problems=$((problems + 1))
+          fi
+          if [ "$problems" -gt 0 ]; then
+            echo "npm-audit-accepted: $problems problem(s) above; nothing is accepted until they are fixed."
+            exit 1
+          fi
+
+          report="$RUNNER_TEMP/npm-audit.json"
+          set +e
+          npm audit --audit-level=high --json > "$report" 2> "$RUNNER_TEMP/npm-audit.stderr"
+          npm_status=$?
+          set -e
+
+          if ! jq -e 'type == "object" and (has("error") | not)' "$report" > /dev/null 2>&1; then
+            echo "::error::npm audit (exit $npm_status) produced no usable report; failing closed."
+            cat "$RUNNER_TEMP/npm-audit.stderr" "$report" || true
+            exit 1
+          fi
+
+          accepted_json="$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {id: .[0], until: .[1], poam: .[2]})' "$accepted_tsv")"
+          found_json="$(jq '
+            [ .vulnerabilities // {}
+              | to_entries[]
+              | .value as $p
+              | $p.via[]?
+              | select(type == "object")
+              | select(.severity == "high" or .severity == "critical")
+              | (.url // "") as $u
+              | { id: (($u | capture("(?<g>GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})").g) // (if $u == "" then "npm advisory \(.source // "?")" else $u end)),
+                  severity, url: (.url // "no advisory url"), title: (.title // ""),
+                  pkg: $p.name, range: ($p.range // "?"), fix: $p.fixAvailable } ]
+          ' "$report")"
+
+          found_count="$(jq -n --argjson f "$found_json" '[$f[].id] | unique | length')"
+          echo "npm audit exited $npm_status: $found_count high/critical advisory id(s) in this lock."
+
+          # Acceptances this run relied on, printed on success and failure alike.
+          jq -rn --argjson a "$accepted_json" --argjson f "$found_json" '
+            $a[] | . as $e | select(any($f[]; .id == $e.id))
+            | "  ACCEPTED  \($e.id) until \($e.until) (\($e.poam))  - \([$f[] | select(.id == $e.id) | .pkg] | unique | join(", ")): \([$f[] | select(.id == $e.id) | .title][0])"
+          '
+
+          # Stale acceptances warn: the advisory has left this lock, so the entry
+          # (and its POAM line) can be closed.
+          jq -rn --argjson a "$accepted_json" --argjson f "$found_json" '
+            $a[] | . as $e | select(any($f[]; .id == $e.id) | not)
+            | "::warning::npm-audit-accepted: \($e.id) (\($e.poam)) matched no advisory in this lock. Remove the entry and close its POAM line."
+          '
+
+          unaccepted_count="$(jq -n --argjson a "$accepted_json" --argjson f "$found_json" '[$f[] | select(.id as $i | any($a[]; .id == $i) | not) | .id] | unique | length')"
+
+          if [ "$npm_status" -ne 0 ] && [ "$found_count" -eq 0 ]; then
+            echo "::error::npm audit exited $npm_status but reported no high/critical advisory; failing closed."
+            echo "::group::npm audit --audit-level=high --json (the authority)"
+            cat "$report"
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          if [ "$unaccepted_count" -eq 0 ]; then
+            echo "npm audit: every high/critical advisory in this lock is accepted and in date."
+            exit 0
+          fi
+
+          echo
+          echo "::error::npm audit: $unaccepted_count high/critical advisory id(s) are not accepted:"
+          jq -rn --argjson a "$accepted_json" --argjson f "$found_json" '
+            [$f[] | select(.id as $i | any($a[]; .id == $i) | not)]
+            | group_by(.pkg)[]
+            | (
+                "  \(map(.severity) | if index("critical") then "CRITICAL" else "HIGH" end)  \(.[0].pkg)  (installed range \(.[0].range))"
+                + (.[0].fix as $x
+                   | if ($x | type) == "object"
+                     then "  -> fix: \($x.name)@\($x.version)\(if $x.isSemVerMajor then " (MAJOR - escalate, do not bump silently)" else "" end)"
+                     elif $x == true then "  -> fix available"
+                     else "  -> NO FIX AVAILABLE" end)
+              ),
+              (.[] | "      \(.severity | ascii_upcase)  \(.url)  \(.title)")
+          '
+          echo
+          echo "Fix on the installed major's patched line with an explicit ~x.y.z constraint."
+          echo "An advisory with no fixed version may be accepted here only with its own dated"
+          echo "POAM line (jims_dev_way/playbooks/deployment.md, advisory response)."
+
+          echo "::group::npm audit --audit-level=high --json (the authority)"
+          cat "$report"
+          echo "::endgroup::"
+
+          exit 1
 
   # ---------------------------------------------------------------------------
   # The release gate. WO-045.
